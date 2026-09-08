@@ -203,7 +203,7 @@ test("schedule_next_run rejects fixed-interval loops", async () => {
   await hooks.dispose?.()
 })
 
-test("failed injections record the error and stay active for retry", async () => {
+test("failed injections record a safe category and stay active for retry", async () => {
   const sent: SentPrompt[] = []
   const hooks = await makeServer(sent, {}, { failPrompts: true })
   const created = JSON.parse(
@@ -213,7 +213,7 @@ test("failed injections record the error and stay active for retry", async () =>
   await sleep(1300)
   const loop = await getLoop(created.created)
   expect(loop?.lastResult).toBe("failed")
-  expect(loop?.lastError).toContain("prompt rejected")
+  expect(loop?.lastError).toBe("provider/model request failed")
   expect(loop?.status).toBe("active")
   await hooks.dispose?.()
 })
@@ -278,7 +278,7 @@ test("system transform merges a loop reminder for sessions with open loops", asy
   await hooks.dispose?.()
 })
 
-test("rehydrates persisted active loops on startup", async () => {
+test("rehydrated loops resume after an authoritative idle event", async () => {
   const sent: SentPrompt[] = []
   const first = await makeServer(sent)
   const created = JSON.parse(
@@ -287,8 +287,31 @@ test("rehydrates persisted active loops on startup", async () => {
   await first.dispose?.()
 
   const second = await makeServer(sent)
+  await tool(second, "list_loops").execute({}, { sessionID: "ses_1" })
   await sleep(1300)
+  expect(sent).toHaveLength(0)
+  await second.event?.({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } } as never)
+  await sleep(1100)
   expect(sent.length).toBeGreaterThanOrEqual(1)
   expect(sent[0]?.text).toContain(created.created)
   await second.dispose?.()
+})
+
+test("V1 rehydrate leaves a foreign unscheduled dynamic loop unchanged", async () => {
+  const first = await makeServer([])
+  const created = JSON.parse(
+    await tool(first, "create_loop").execute({ instruction: "watch CI" }, { sessionID: "ses_foreign" }),
+  ) as { created: string }
+  const before = await getLoop(created.created)
+
+  const foreign = await makeServer([])
+  await foreign.event?.({ event: { type: "session.idle", properties: { sessionID: "ses_foreign" } } } as never)
+  await sleep(100)
+  const after = await getLoop(created.created)
+
+  expect(after?.status).toBe(before?.status)
+  expect(after?.stopReason).toBe(before?.stopReason)
+  expect(after?.updatedAt).toBe(before?.updatedAt)
+  await foreign.dispose?.()
+  await first.dispose?.()
 })

@@ -124,7 +124,7 @@ A dynamic loop mirrors Claude Code's self-paced `/loop`: at the end of each iter
 
 - Iterations only run while the session is idle. If a loop comes due while the session is busy, it is deferred with a short backoff and retried when the session goes idle.
 - If several loops in one session are due at once, one iteration is injected and the rest wait for the next idle.
-- Failed injections are recorded in the loop's `lastError` and retried after a backoff; they never crash OpenCode.
+- Failed injections store only the safe `provider/model request failed` category. They use bounded exponential backoff and are paused after five consecutive failures by default; provider responses and session data are never persisted or logged.
 - Loops are stopped automatically when their session is deleted, when `max_runs` is reached, or after 7 days (configurable).
 
 ## Options
@@ -141,6 +141,8 @@ In OpenCode 1, server options use the package-and-options tuple in `opencode.jso
         "max_loops_per_session": 5,
         "busy_backoff_seconds": 60,
         "failure_backoff_seconds": 60,
+        "max_failure_backoff_seconds": 3600,
+        "max_consecutive_failures": 5,
         "max_loop_age_days": 7,
         "dynamic_max_delay_seconds": 86400,
         "restricted_agents": ["plan"],
@@ -164,6 +166,8 @@ In OpenCode 2, use the plugin object form:
         "max_loops_per_session": 5,
         "busy_backoff_seconds": 60,
         "failure_backoff_seconds": 60,
+        "max_failure_backoff_seconds": 3600,
+        "max_consecutive_failures": 5,
         "max_loop_age_days": 7,
         "dynamic_max_delay_seconds": 86400,
         "restricted_agents": ["plan"],
@@ -180,7 +184,9 @@ Defaults:
 - `min_interval_seconds`: `30`; the smallest accepted interval and the lower clamp for dynamic delays.
 - `max_loops_per_session`: `5` open (active or paused) loops per session.
 - `busy_backoff_seconds`: `60`; retry delay when an iteration comes due while the session is busy.
-- `failure_backoff_seconds`: `60`; retry delay when injecting the iteration prompt fails.
+- `failure_backoff_seconds`: `60`; base retry delay when injecting the iteration prompt fails. Consecutive failures double this delay.
+- `max_failure_backoff_seconds`: `3600`; upper bound for exponential failure backoff.
+- `max_consecutive_failures`: `5`; number of consecutive provider/model failures after which the loop is paused with an inspectable `blockedReason`.
 - `max_loop_age_days`: `7`; loops stop automatically after this age. Set `0` to disable expiry.
 - `dynamic_max_delay_seconds`: `86400`; upper clamp for `schedule_next_run` delays.
 - `restricted_agents`: `["plan"]`; iterations are deferred while the session's last prompt came from one of these agents.
@@ -203,7 +209,7 @@ If `XDG_DATA_HOME` is not set, the default is:
 
 Set `OPENCODE_LOOP_STATE_PATH` to use a custom file.
 
-The state file is written atomically with owner-only permissions when the host filesystem supports it. Active interval loops are rehydrated and rescheduled when OpenCode restarts. Dynamic loops that were waiting on the agent to schedule their next run cannot recover on their own after a restart and are stopped with an explanatory reason.
+The state file is written atomically with owner-only permissions when the host filesystem supports it. Persisted loops are rehydrated only after authoritative session context establishes a renewable session lease, preventing concurrent OpenCode instances from driving the same session. Dynamic loops that were waiting on the agent to schedule their next run cannot recover on their own after a restart and are stopped with an explanatory reason.
 
 ## Credits
 

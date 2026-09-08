@@ -452,7 +452,7 @@ test("V2 session deletion stops the session's loops", async () => {
   await cleanup()
 })
 
-test("V2 setup rehydrates persisted active loops", async () => {
+test("V2 rehydrated loops resume after an authoritative idle event", async () => {
   const first = makeMockContext()
   const cleanup1 = await plugin.setup(first as never)
   const created = JSON.parse(
@@ -463,12 +463,42 @@ test("V2 setup rehydrates persisted active loops", async () => {
 
   const second = makeMockContext()
   const cleanup2 = await plugin.setup(second as never)
+  await Bun.sleep(1100)
+  expect(second.promptCalls).toHaveLength(0)
+  second.stream.push({
+    type: "session.status",
+    created: Date.now(),
+    data: { sessionID: "ses_v2", status: { type: "idle" } },
+  })
   await waitFor(() => second.promptCalls.length >= 1)
   expect(second.promptCalls[0]?.text).toContain(created.created)
   await waitFor(async () => (await getLoop(created.created))?.runCount === 1)
 
   second.stream.end()
   await cleanup2()
+})
+
+test("V2 rehydrate leaves a foreign unscheduled dynamic loop unchanged", async () => {
+  const owner = makeMockContext()
+  const cleanupOwner = await plugin.setup(owner as never)
+  const created = JSON.parse(
+    contentOf(await loopTool(owner, "create_loop").execute({ instruction: "watch CI" }, toolContext("ses_foreign"))),
+  ) as { created: string }
+  const before = await getLoop(created.created)
+
+  const foreign = makeMockContext()
+  const cleanupForeign = await plugin.setup(foreign as never)
+  foreign.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_foreign" } })
+  await sleep(100)
+  const after = await getLoop(created.created)
+
+  expect(after?.status).toBe(before?.status)
+  expect(after?.stopReason).toBe(before?.stopReason)
+  expect(after?.updatedAt).toBe(before?.updatedAt)
+  foreign.stream.end()
+  await cleanupForeign()
+  owner.stream.end()
+  await cleanupOwner()
 })
 
 test("V2 concurrent plugin contexts claim a persisted run only once", async () => {
@@ -482,6 +512,11 @@ test("V2 concurrent plugin contexts claim a persisted run only once", async () =
   const second = makeMockContext()
   const cleanupFirst = await plugin.setup(first as never)
   const cleanupSecond = await plugin.setup(second as never)
+  first.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } })
+  second.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } })
+
+  first.stream.push({ type: "session.status", created: Date.now(), data: { sessionID: "ses_v2", status: { type: "idle" } } })
+  second.stream.push({ type: "session.status", created: Date.now(), data: { sessionID: "ses_v2", status: { type: "idle" } } })
 
   await waitFor(() => first.promptCalls.length + second.promptCalls.length >= 1)
   await sleep(100)

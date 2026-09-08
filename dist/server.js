@@ -1,9 +1,10 @@
 // @bun
 // src/server.ts
+import { randomUUID } from "crypto";
 import { z } from "zod";
 
 // src/state.ts
-import { chmod, mkdir, readFile, rename, writeFile } from "fs/promises";
+import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { Data, Effect, Schema } from "effect";
@@ -37,15 +38,31 @@ var LoopSchema = Schema.Struct({
     default: () => null
   }),
   lastError: Schema.optionalWith(NullableString, { default: () => null }),
+  consecutiveFailures: Schema.optionalWith(Schema.Number, { default: () => 0 }),
+  nextRetryAt: Schema.optionalWith(NullableNumber, { default: () => null }),
+  blockedReason: Schema.optionalWith(NullableString, { default: () => null }),
   lastReason: Schema.optionalWith(NullableString, { default: () => null }),
   runCount: Schema.optionalWith(Schema.Number, { default: () => 0 }),
   maxRuns: Schema.optionalWith(NullableNumber, { default: () => null }),
   agent: Schema.optionalWith(NullableString, { default: () => null }),
-  stopReason: Schema.optionalWith(NullableString, { default: () => null })
+  stopReason: Schema.optionalWith(NullableString, { default: () => null }),
+  ownerID: Schema.optionalWith(NullableString, { default: () => null }),
+  ownerLeaseUntil: Schema.optionalWith(NullableNumber, { default: () => null }),
+  ownerRevision: Schema.optionalWith(Schema.Number, { default: () => 0 }),
+  runClaimToken: Schema.optionalWith(Schema.Number, { default: () => 0 })
+});
+var SessionLeaseSchema = Schema.Struct({
+  sessionID: Schema.String,
+  instanceID: Schema.String,
+  expiresAt: Schema.Number,
+  revision: Schema.Number
 });
 var StateSchema = Schema.Struct({
   version: Schema.Literal(1),
-  loops: Schema.Record({ key: Schema.String, value: LoopSchema })
+  loops: Schema.Record({ key: Schema.String, value: LoopSchema }),
+  sessionLeases: Schema.optionalWith(Schema.Record({ key: Schema.String, value: SessionLeaseSchema }), {
+    default: () => ({})
+  })
 });
 function defaultStateFile() {
   const dataHome = process.env.XDG_DATA_HOME || (process.platform === "win32" && process.env.APPDATA ? process.env.APPDATA : join(homedir(), ".local", "share"));
@@ -58,7 +75,7 @@ function now() {
   return Date.now();
 }
 function emptyState() {
-  return { version: 1, loops: {} };
+  return { version: 1, loops: {}, sessionLeases: {} };
 }
 function isMissingStateFile(error) {
   return typeof error === "object" && error !== null && error.code === "ENOENT";
@@ -107,7 +124,6 @@ function enqueueMutation(operation) {
   });
   return current;
 }
-var MAX_MUTATION_ATTEMPTS = 5;
 async function readRawState() {
   try {
     return await readFile(statePath(), "utf8");
@@ -117,10 +133,42 @@ async function readRawState() {
     throw error;
   }
 }
+var LOCK_STALE_MS = 30000;
+var LOCK_RETRY_MS = 10;
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+async function acquireMutationLock() {
+  const file = statePath();
+  const lock = `${file}.lock`;
+  await mkdir(dirname(file), { recursive: true, mode: 448 });
+  for (;; ) {
+    try {
+      await mkdir(lock, { mode: 448 });
+      return async () => rm(lock, { recursive: true, force: true });
+    } catch (error) {
+      if (error.code !== "EEXIST")
+        throw error;
+      try {
+        const lockStat = await stat(lock);
+        if (Date.now() - lockStat.mtimeMs > LOCK_STALE_MS) {
+          const stale = `${lock}.stale.${process.pid}.${Date.now()}`;
+          await rename(lock, stale);
+          await rm(stale, { recursive: true, force: true });
+          continue;
+        }
+      } catch (lockError) {
+        if (!isMissingStateFile(lockError))
+          throw lockError;
+      }
+      await sleep(LOCK_RETRY_MS);
+    }
+  }
+}
 async function mutate(fn) {
   return enqueueMutation(async () => {
-    let lastError;
-    for (let attempt = 0;attempt < MAX_MUTATION_ATTEMPTS; attempt += 1) {
+    const release = await acquireMutationLock();
+    try {
       const before = await readRawState();
       const result = await Effect.runPromise(Effect.gen(function* () {
         const state = before == null ? emptyState() : yield* Effect.try({
@@ -133,15 +181,11 @@ async function mutate(fn) {
         });
         return { state, value };
       }));
-      const current = await readRawState();
-      if (current !== before) {
-        lastError = new Error("state file changed by a concurrent writer");
-        continue;
-      }
       await Effect.runPromise(writeStateEffect(result.state));
       return result.value;
+    } finally {
+      await release();
     }
-    throw lastError instanceof Error ? lastError : new Error("state mutation failed after concurrent-writer retries");
   });
 }
 var INTERVAL_PATTERN = /^(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$/i;
@@ -224,7 +268,7 @@ async function createLoop(sessionID, options) {
   const maxLoops = positiveIntegerOrNull(options.maxLoopsPerSession) ?? DEFAULT_MAX_LOOPS_PER_SESSION;
   const agent = typeof options.agent === "string" && options.agent.trim() ? options.agent.trim() : null;
   return mutate((state) => {
-    const open = Object.values(state.loops).filter((loop2) => loop2.sessionID === sessionID && isOpen(loop2.status));
+    const open = Object.values(state.loops).filter((loop) => loop.sessionID === sessionID && isOpen(loop.status));
     if (open.length >= maxLoops) {
       throw new Error(`this session already has ${open.length} open loop(s); stop one before creating another (limit ${maxLoops})`);
     }
@@ -245,11 +289,18 @@ async function createLoop(sessionID, options) {
       lastRunAt: null,
       lastResult: null,
       lastError: null,
+      consecutiveFailures: 0,
+      nextRetryAt: null,
+      blockedReason: null,
       lastReason: null,
       runCount: 0,
       maxRuns,
       agent,
-      stopReason: null
+      stopReason: null,
+      ownerID: null,
+      ownerLeaseUntil: null,
+      ownerRevision: 0,
+      runClaimToken: 0
     };
     state.loops[id] = loop;
     return snapshot(loop);
@@ -260,19 +311,103 @@ async function getLoop(loopID) {
   const loop = state.loops[loopID];
   return loop ? snapshot(loop) : null;
 }
-async function claimDueRun(loopID, leaseMs) {
+function validLeaseMs(value) {
+  const leaseMs = positiveIntegerOrNull(Math.round(value));
+  if (leaseMs == null)
+    throw new Error("session lease must be a positive number of milliseconds");
+  return leaseMs;
+}
+async function acquireSessionLease(sessionID, instanceID, leaseMs) {
+  const duration = validLeaseMs(leaseMs);
+  return mutate((state) => {
+    const timestamp = now();
+    const current = state.sessionLeases[sessionID];
+    if (current && current.instanceID !== instanceID && current.expiresAt > timestamp)
+      return null;
+    const lease = {
+      sessionID,
+      instanceID,
+      expiresAt: timestamp + duration,
+      revision: (current?.revision ?? 0) + 1
+    };
+    state.sessionLeases[sessionID] = lease;
+    return { ...lease };
+  });
+}
+async function renewSessionLease(sessionID, instanceID, revision, leaseMs) {
+  const duration = validLeaseMs(leaseMs);
+  return mutate((state) => {
+    const timestamp = now();
+    const current = state.sessionLeases[sessionID];
+    if (!current || current.instanceID !== instanceID || current.revision !== revision || current.expiresAt <= timestamp)
+      return null;
+    current.expiresAt = timestamp + duration;
+    current.revision += 1;
+    return { ...current };
+  });
+}
+async function ownsSessionLease(sessionID, instanceID, revision) {
+  const state = await readState();
+  const lease = state.sessionLeases[sessionID];
+  return Boolean(lease && lease.instanceID === instanceID && lease.revision === revision && lease.expiresAt > now());
+}
+async function releaseSessionLease(sessionID, instanceID, revision) {
+  return mutate((state) => {
+    const current = state.sessionLeases[sessionID];
+    if (!current || current.instanceID !== instanceID || current.revision !== revision)
+      return false;
+    delete state.sessionLeases[sessionID];
+    return true;
+  });
+}
+async function acquireLoopOwner(loopID, ownerID, leaseMs) {
+  const lease = positiveIntegerOrNull(Math.round(leaseMs));
+  if (!ownerID.trim())
+    throw new Error("loop owner id must not be empty");
+  if (lease == null)
+    throw new Error("owner lease must be a positive number of milliseconds");
+  return mutate((state) => {
+    const loop = requireLoop(state, loopID);
+    const timestamp = now();
+    if (loop.status !== "active")
+      return null;
+    if (loop.ownerID !== ownerID && loop.ownerLeaseUntil != null && loop.ownerLeaseUntil > timestamp)
+      return null;
+    if (loop.ownerID !== ownerID)
+      loop.ownerRevision += 1;
+    loop.ownerID = ownerID;
+    loop.ownerLeaseUntil = timestamp + lease;
+    loop.updatedAt = timestamp;
+    return { ownerID, ownerRevision: loop.ownerRevision };
+  });
+}
+async function claimDueRunOwned(loopID, owner, leaseMs) {
   const lease = positiveIntegerOrNull(Math.round(leaseMs));
   if (lease == null)
     throw new Error("run claim lease must be a positive number of milliseconds");
   return mutate((state) => {
     const loop = requireLoop(state, loopID);
     const timestamp = now();
+    if (!matchesOwner(loop, owner, timestamp))
+      return null;
     if (loop.status !== "active" || loop.nextRunAt == null || loop.nextRunAt > timestamp)
       return null;
+    loop.runClaimToken += 1;
     loop.nextRunAt = timestamp + lease;
     loop.updatedAt = timestamp;
-    return snapshot(loop);
+    return { ...owner, claimToken: loop.runClaimToken, loop: snapshot(loop) };
   });
+}
+function matchesOwner(loop, owner, timestamp = now()) {
+  return loop.ownerID === owner.ownerID && loop.ownerRevision === owner.ownerRevision && (loop.ownerLeaseUntil ?? 0) > timestamp;
+}
+function matchesClaim(loop, claim, timestamp = now()) {
+  return matchesOwner(loop, claim, timestamp) && loop.runClaimToken === claim.claimToken;
+}
+async function confirmRunClaim(loopID, claim) {
+  const state = await readState();
+  const loop = state.loops[loopID];
+  return loop != null && matchesClaim(loop, claim) ? snapshot(loop) : null;
 }
 async function listLoops(sessionID) {
   const state = await readState();
@@ -293,6 +428,7 @@ async function pauseLoop(loopID) {
       throw new Error(`loop "${loopID}" is ${loop.status}; only active loops can be paused`);
     loop.status = "paused";
     loop.nextRunAt = null;
+    loop.nextRetryAt = null;
     loop.stopReason = "paused";
     loop.updatedAt = now();
     return snapshot(loop);
@@ -306,6 +442,9 @@ async function resumeLoop(loopID) {
     const timestamp = now();
     loop.status = "active";
     loop.stopReason = null;
+    loop.blockedReason = null;
+    loop.consecutiveFailures = 0;
+    loop.nextRetryAt = null;
     loop.nextRunAt = loop.mode === "interval" ? timestamp + loop.intervalMs : timestamp;
     loop.updatedAt = timestamp;
     return snapshot(loop);
@@ -318,7 +457,22 @@ async function stopLoop(loopID, reason) {
       throw new Error(`loop "${loopID}" is already ${loop.status}`);
     loop.status = "stopped";
     loop.nextRunAt = null;
+    loop.nextRetryAt = null;
     loop.stopReason = typeof reason === "string" && reason.trim() ? reason.trim().slice(0, 400) : "stopped";
+    loop.updatedAt = now();
+    return snapshot(loop);
+  });
+}
+async function stopLoopIfUnchanged(loopID, expectedUpdatedAt, reason) {
+  return mutate((state) => {
+    const loop = state.loops[loopID];
+    if (!loop)
+      return null;
+    if (loop.updatedAt !== expectedUpdatedAt || loop.status !== "active" || loop.mode !== "dynamic" || loop.nextRunAt != null) {
+      return null;
+    }
+    loop.status = "stopped";
+    loop.stopReason = reason.trim().slice(0, 400) || "stopped";
     loop.updatedAt = now();
     return snapshot(loop);
   });
@@ -331,6 +485,7 @@ async function stopLoopsForSession(sessionID, reason) {
         continue;
       loop.status = "stopped";
       loop.nextRunAt = null;
+      loop.nextRetryAt = null;
       loop.stopReason = reason;
       loop.updatedAt = now();
       stopped.push(snapshot(loop));
@@ -360,55 +515,87 @@ async function scheduleNextRun(loopID, delayMs, reason) {
       throw new Error(`loop "${loopID}" is ${loop.status}; only active loops can be scheduled`);
     const timestamp = now();
     loop.nextRunAt = timestamp + delay;
+    loop.nextRetryAt = null;
     loop.lastReason = typeof reason === "string" && reason.trim() ? reason.trim().slice(0, 400) : loop.lastReason;
     loop.updatedAt = timestamp;
     return snapshot(loop);
   });
 }
-async function recordRunSent(loopID) {
+async function recordRunSentClaimed(loopID, claim) {
   return mutate((state) => {
     const loop = requireLoop(state, loopID);
-    if (loop.status !== "active")
-      return snapshot(loop);
+    if (!matchesClaim(loop, claim) || loop.status !== "active")
+      return null;
     const timestamp = now();
     loop.runCount += 1;
     loop.lastRunAt = timestamp;
     loop.lastResult = "sent";
     loop.lastError = null;
+    loop.consecutiveFailures = 0;
+    loop.nextRetryAt = null;
+    loop.blockedReason = null;
     loop.updatedAt = timestamp;
     if (loop.maxRuns != null && loop.runCount >= loop.maxRuns) {
       loop.status = "completed";
       loop.nextRunAt = null;
       loop.stopReason = `max runs reached (${loop.maxRuns})`;
-    } else if (loop.mode === "interval") {
+    } else if (loop.mode === "interval")
       loop.nextRunAt = timestamp + loop.intervalMs;
-    } else {
+    else
       loop.nextRunAt = null;
+    return snapshot(loop);
+  });
+}
+async function recordRunFailedClaimed(loopID, claim, _error, retryDelayMs, maxConsecutiveFailures = 5, maxRetryDelayMs = 60 * 60 * 1000) {
+  return mutate((state) => {
+    const loop = requireLoop(state, loopID);
+    if (!matchesClaim(loop, claim) || loop.status !== "active")
+      return null;
+    const timestamp = now();
+    loop.lastResult = "failed";
+    loop.lastError = "provider/model request failed";
+    loop.consecutiveFailures += 1;
+    loop.updatedAt = timestamp;
+    if (loop.consecutiveFailures >= Math.max(1, Math.round(maxConsecutiveFailures))) {
+      loop.status = "paused";
+      loop.nextRunAt = null;
+      loop.nextRetryAt = null;
+      loop.blockedReason = `paused after ${loop.consecutiveFailures} consecutive provider/model failures`;
+      loop.stopReason = loop.blockedReason;
+    } else {
+      const baseDelay = Math.max(1, Math.round(retryDelayMs));
+      const cap = Math.max(baseDelay, Math.round(maxRetryDelayMs));
+      const delay = Math.min(cap, baseDelay * 2 ** (loop.consecutiveFailures - 1));
+      loop.nextRetryAt = timestamp + delay;
+      loop.nextRunAt = loop.nextRetryAt;
+      loop.blockedReason = null;
     }
     return snapshot(loop);
   });
 }
-async function recordRunDeferred(loopID, result, retryDelayMs) {
+async function recordRunDeferredClaimed(loopID, claim, result, retryDelayMs) {
   return mutate((state) => {
     const loop = requireLoop(state, loopID);
-    if (loop.status !== "active")
-      return snapshot(loop);
+    if (!matchesClaim(loop, claim) || loop.status !== "active")
+      return null;
     const timestamp = now();
     loop.lastResult = result;
+    loop.nextRetryAt = null;
     loop.nextRunAt = timestamp + Math.max(0, Math.round(retryDelayMs));
     loop.updatedAt = timestamp;
     return snapshot(loop);
   });
 }
-async function recordRunFailed(loopID, error, retryDelayMs) {
+async function stopLoopClaimed(loopID, claim, reason) {
   return mutate((state) => {
     const loop = requireLoop(state, loopID);
-    const timestamp = now();
-    loop.lastResult = "failed";
-    loop.lastError = error.slice(0, 400);
-    loop.updatedAt = timestamp;
-    if (loop.status === "active")
-      loop.nextRunAt = timestamp + Math.max(0, Math.round(retryDelayMs));
+    if (!matchesClaim(loop, claim) || !isOpen(loop.status))
+      return null;
+    loop.status = "stopped";
+    loop.nextRunAt = null;
+    loop.nextRetryAt = null;
+    loop.stopReason = typeof reason === "string" && reason.trim() ? reason.trim().slice(0, 400) : "stopped";
+    loop.updatedAt = now();
     return snapshot(loop);
   });
 }
@@ -513,9 +700,13 @@ Preserve each loop's id, cadence, instruction, and status in the compacted conte
 var DEFAULT_COMMAND_NAME = "loop";
 var DEFAULT_BUSY_BACKOFF_SECONDS = 60;
 var DEFAULT_FAILURE_BACKOFF_SECONDS = 60;
+var DEFAULT_MAX_FAILURE_BACKOFF_SECONDS = 60 * 60;
+var DEFAULT_MAX_CONSECUTIVE_FAILURES = 5;
 var DEFAULT_MAX_LOOP_AGE_DAYS = 7;
 var DEFAULT_DYNAMIC_MAX_DELAY_SECONDS = 24 * 60 * 60;
 var RUN_CLAIM_LEASE_MS = 30000;
+var SESSION_LEASE_MS = 90000;
+var SESSION_LEASE_HEARTBEAT_MS = 30000;
 var DEFAULT_RESTRICTED_AGENTS = ["plan"];
 var LOOP_SYSTEM_MARKER = "OpenCode loop mode";
 function commandNameFromOptions(options) {
@@ -565,6 +756,21 @@ function isBusyEvent(event) {
   const status = event.properties?.status;
   return event.type === "session.status" && isRecord(status) && status.type === "busy";
 }
+function enqueueSessionOperation(queues, sessionID, operation) {
+  const previous = queues.get(sessionID) ?? Promise.resolve();
+  const current = previous.then(operation, operation);
+  const settled = current.then(() => {
+    return;
+  }, () => {
+    return;
+  });
+  queues.set(sessionID, settled);
+  settled.then(() => {
+    if (queues.get(sessionID) === settled)
+      queues.delete(sessionID);
+  });
+  return current;
+}
 async function toolResult(sessionID, extra = {}) {
   const loops = await listLoops(sessionID);
   return JSON.stringify({ ...extra, loops, report: formatLoops(loops) }, null, 2);
@@ -576,13 +782,20 @@ var server = async ({ client }, options) => {
   const maxLoopsPerSession = positiveNumberOr(options?.max_loops_per_session, DEFAULT_MAX_LOOPS_PER_SESSION);
   const busyBackoffMs = positiveNumberOr(options?.busy_backoff_seconds, DEFAULT_BUSY_BACKOFF_SECONDS) * 1000;
   const failureBackoffMs = positiveNumberOr(options?.failure_backoff_seconds, DEFAULT_FAILURE_BACKOFF_SECONDS) * 1000;
+  const maxFailureBackoffMs = positiveNumberOr(options?.max_failure_backoff_seconds, DEFAULT_MAX_FAILURE_BACKOFF_SECONDS) * 1000;
+  const maxConsecutiveFailures = positiveNumberOr(options?.max_consecutive_failures, DEFAULT_MAX_CONSECUTIVE_FAILURES);
   const maxLoopAgeMs = nonNegativeNumberOr(options?.max_loop_age_days, DEFAULT_MAX_LOOP_AGE_DAYS) * 24 * 60 * 60 * 1000;
   const dynamicMaxDelaySeconds = positiveNumberOr(options?.dynamic_max_delay_seconds, DEFAULT_DYNAMIC_MAX_DELAY_SECONDS);
   const restrictedAgents = restrictedAgentSet(options);
   const timers = new Map;
   const sendingLoops = new Set;
   const busySessions = new Set;
+  const instanceID = randomUUID();
+  const loopOwnerID = `server:${process.pid}:${randomUUID()}`;
+  const ownedSessions = new Map;
+  const ownershipQueues = new Map;
   const observedSessions = new Set;
+  const staleDynamicCandidates = new Map;
   const lastPromptAgentBySession = new Map;
   const dynamicPending = new Map;
   const isRestrictedAgent = (agent) => typeof agent === "string" && restrictedAgents.has(agent.trim().toLowerCase());
@@ -597,11 +810,48 @@ var server = async ({ client }, options) => {
       clearTimeout(timer);
     timers.delete(loopID);
   }
-  function scheduleTimer(loop) {
+  async function loseOwnership(sessionID) {
+    ownedSessions.delete(sessionID);
+    for (const loop of await activeLoops(sessionID))
+      cancelTimer(loop.id);
+    for (const [loopID, pending] of dynamicPending) {
+      if (pending.sessionID === sessionID)
+        dynamicPending.delete(loopID);
+    }
+  }
+  async function acquireOwnership(sessionID) {
+    return enqueueSessionOperation(ownershipQueues, sessionID, async () => {
+      observedSessions.add(sessionID);
+      const lease = await acquireSessionLease(sessionID, instanceID, SESSION_LEASE_MS);
+      if (!lease) {
+        await loseOwnership(sessionID);
+        return false;
+      }
+      ownedSessions.set(sessionID, lease);
+      for (const loop of await activeLoops(sessionID))
+        scheduleTimer(loop);
+      return true;
+    });
+  }
+  async function renewOwnership(sessionID) {
+    return enqueueSessionOperation(ownershipQueues, sessionID, async () => {
+      const lease = ownedSessions.get(sessionID);
+      if (!lease)
+        return false;
+      const renewed = await renewSessionLease(sessionID, instanceID, lease.revision, SESSION_LEASE_MS);
+      if (!renewed) {
+        await loseOwnership(sessionID);
+        return false;
+      }
+      ownedSessions.set(sessionID, renewed);
+      return true;
+    });
+  }
+  function scheduleTimer(loop, minimumDelayMs = 0) {
     cancelTimer(loop.id);
-    if (loop.status !== "active" || loop.nextRunAt == null)
+    if (loop.status !== "active" || loop.nextRunAt == null || !ownedSessions.has(loop.sessionID))
       return;
-    const delay = Math.max(0, loop.nextRunAt - Date.now());
+    const delay = Math.max(minimumDelayMs, loop.nextRunAt - Date.now());
     const timer = setTimeout(() => {
       timers.delete(loop.id);
       runDue(loop.id);
@@ -617,11 +867,8 @@ var server = async ({ client }, options) => {
     sendingLoops.add(loopID);
     try {
       await runDueLocked(loopID);
-    } catch (error) {
-      await log("error", "Loop iteration failed unexpectedly", {
-        loopID,
-        error: error instanceof Error ? error.message : String(error)
-      });
+    } catch {
+      await log("error", "Loop scheduler operation failed", { loopID, category: "scheduler" });
     } finally {
       sendingLoops.delete(loopID);
     }
@@ -630,34 +877,61 @@ var server = async ({ client }, options) => {
     let loop = await getLoop(loopID);
     if (!loop || loop.status !== "active" || loop.nextRunAt == null)
       return;
+    if (!await renewOwnership(loop.sessionID))
+      return;
+    const lease = ownedSessions.get(loop.sessionID);
+    if (!lease || !await ownsSessionLease(loop.sessionID, instanceID, lease.revision)) {
+      await loseOwnership(loop.sessionID);
+      return;
+    }
     if (loop.nextRunAt > Date.now()) {
       scheduleTimer(loop);
       return;
     }
-    const claimed = await claimDueRun(loopID, RUN_CLAIM_LEASE_MS);
+    if (!observedSessions.has(loop.sessionID)) {
+      scheduleTimer(loop, Math.min(loop.intervalMs ?? busyBackoffMs, busyBackoffMs));
+      await log("info", "Skipping loop because session ownership is unknown", { loopID, category: "ownership" });
+      return;
+    }
+    const owner = await acquireLoopOwner(loopID, loopOwnerID, RUN_CLAIM_LEASE_MS);
+    const claimed = owner ? await claimDueRunOwned(loopID, owner, RUN_CLAIM_LEASE_MS) : null;
     if (!claimed) {
       loop = await getLoop(loopID);
       if (loop)
         scheduleTimer(loop);
       return;
     }
-    loop = claimed;
+    loop = claimed.loop;
     if (maxLoopAgeMs > 0 && Date.now() - loop.createdAt >= maxLoopAgeMs) {
-      await stopLoop(loopID, `expired after ${Math.round(maxLoopAgeMs / 86400000)} days`);
+      await stopLoopClaimed(loopID, claimed, `expired after ${Math.round(maxLoopAgeMs / 86400000)} days`);
       return;
     }
     if (busySessions.has(loop.sessionID)) {
-      const deferred = await recordRunDeferred(loopID, "skipped_busy", Math.min(loop.intervalMs ?? busyBackoffMs, busyBackoffMs));
-      scheduleTimer(deferred);
+      const deferred = await recordRunDeferredClaimed(loopID, claimed, "skipped_busy", Math.min(loop.intervalMs ?? busyBackoffMs, busyBackoffMs));
+      if (deferred)
+        scheduleTimer(deferred);
       return;
     }
     if (isRestrictedAgent(lastPromptAgentBySession.get(loop.sessionID))) {
-      const deferred = await recordRunDeferred(loopID, "skipped_plan", Math.min(loop.intervalMs ?? busyBackoffMs, busyBackoffMs));
-      scheduleTimer(deferred);
+      const deferred = await recordRunDeferredClaimed(loopID, claimed, "skipped_plan", Math.min(loop.intervalMs ?? busyBackoffMs, busyBackoffMs));
+      if (deferred)
+        scheduleTimer(deferred);
+      return;
+    }
+    const injectionLease = ownedSessions.get(loop.sessionID);
+    if (!injectionLease || !await ownsSessionLease(loop.sessionID, instanceID, injectionLease.revision)) {
+      await loseOwnership(loop.sessionID);
       return;
     }
     if (loop.mode === "dynamic") {
       dynamicPending.set(loopID, { sessionID: loop.sessionID, sawBusy: false });
+    }
+    if (!await confirmRunClaim(loopID, claimed)) {
+      dynamicPending.delete(loopID);
+      const current = await getLoop(loopID);
+      if (current)
+        scheduleTimer(current);
+      return;
     }
     try {
       await client.session.promptAsync({
@@ -669,27 +943,31 @@ var server = async ({ client }, options) => {
       });
     } catch (error) {
       dynamicPending.delete(loopID);
-      if (!observedSessions.has(loop.sessionID)) {
-        await log("info", "Skipping loop for a session this process has not observed", { loopID, sessionID: loop.sessionID });
-        return;
+      const failed = await recordRunFailedClaimed(loopID, claimed, error instanceof Error ? error.message : String(error), failureBackoffMs, maxConsecutiveFailures, maxFailureBackoffMs);
+      if (failed)
+        scheduleTimer(failed);
+      else {
+        const current = await getLoop(loopID);
+        if (current)
+          scheduleTimer(current);
       }
-      const failed = await recordRunFailed(loopID, error instanceof Error ? error.message : String(error), failureBackoffMs);
-      scheduleTimer(failed);
-      await log("error", "Loop iteration prompt failed", { loopID, error: failed.lastError ?? undefined });
+      await log("error", "Loop iteration prompt failed", { loopID, error: failed?.lastError ?? undefined });
       return;
     }
     busySessions.add(loop.sessionID);
     observedSessions.add(loop.sessionID);
-    const sent = await recordRunSent(loopID);
+    const sent = await recordRunSentClaimed(loopID, claimed);
+    if (!sent)
+      return;
     if (sent.mode !== "dynamic" || sent.status !== "active")
       dynamicPending.delete(loopID);
     scheduleTimer(sent);
   }
   async function runDueForSession(sessionID) {
     const loops = await activeLoops(sessionID);
-    const now2 = Date.now();
+    const now = Date.now();
     for (const loop of loops) {
-      if (loop.nextRunAt == null || loop.nextRunAt > now2)
+      if (loop.nextRunAt == null || loop.nextRunAt > now)
         continue;
       await runDue(loop.id);
       if (busySessions.has(sessionID))
@@ -716,15 +994,30 @@ var server = async ({ client }, options) => {
     const loops = await activeLoops();
     for (const loop of loops) {
       if (loop.nextRunAt == null) {
-        if (loop.mode === "dynamic")
-          await stopLoop(loop.id, "not rescheduled before OpenCode restarted");
+        if (loop.mode === "dynamic") {
+          staleDynamicCandidates.set(loop.id, { sessionID: loop.sessionID, updatedAt: loop.updatedAt });
+          await log("info", "Dynamic loop is an orphaned/stale restart candidate pending session ownership", {
+            loopID: loop.id,
+            sessionID: loop.sessionID
+          });
+        }
         continue;
       }
-      scheduleTimer(loop);
+    }
+  }
+  async function observeSession(sessionID) {
+    observedSessions.add(sessionID);
+    if (!await acquireOwnership(sessionID))
+      return;
+    for (const [loopID, candidate] of staleDynamicCandidates) {
+      if (candidate.sessionID !== sessionID)
+        continue;
+      staleDynamicCandidates.delete(loopID);
+      await stopLoopIfUnchanged(loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted");
     }
   }
   async function requireSessionLoop(loopID, sessionID) {
-    observedSessions.add(sessionID);
+    await observeSession(sessionID);
     const loop = await getLoop(loopID);
     if (!loop)
       throw new Error(`no loop found with id "${loopID}"`);
@@ -732,13 +1025,21 @@ var server = async ({ client }, options) => {
       throw new Error(`loop "${loopID}" belongs to a different session`);
     return loop;
   }
-  await rehydrate().catch((error) => log("error", "Failed to rehydrate loops", { error: error instanceof Error ? error.message : String(error) }));
+  await rehydrate().catch(() => log("error", "Failed to rehydrate loops", { category: "state" }));
+  const leaseHeartbeat = setInterval(() => {
+    for (const sessionID of ownedSessions.keys())
+      renewOwnership(sessionID);
+  }, SESSION_LEASE_HEARTBEAT_MS);
+  leaseHeartbeat.unref?.();
   return {
     async dispose() {
+      clearInterval(leaseHeartbeat);
       for (const timer of timers.values())
         clearTimeout(timer);
       timers.clear();
       dynamicPending.clear();
+      await Promise.all([...ownedSessions.values()].map((lease) => releaseSessionLease(lease.sessionID, instanceID, lease.revision)));
+      ownedSessions.clear();
     },
     async config(config) {
       if (!registerCommand)
@@ -755,7 +1056,7 @@ var server = async ({ client }, options) => {
         },
         async execute(args, context) {
           const input = args;
-          observedSessions.add(context.sessionID);
+          await observeSession(context.sessionID);
           const dynamic = !input.interval?.trim();
           const loop = await createLoop(context.sessionID, {
             prompt: input.instruction,
@@ -777,7 +1078,6 @@ var server = async ({ client }, options) => {
         description: "List the loops for this OpenCode session, including status, cadence, run counts, and next scheduled run.",
         args: {},
         async execute(_args, context) {
-          observedSessions.add(context.sessionID);
           return toolResult(context.sessionID);
         }
       },
@@ -868,7 +1168,7 @@ var server = async ({ client }, options) => {
         description: "Delete stopped and completed loops for this session. Active and paused loops are kept.",
         args: {},
         async execute(_args, context) {
-          observedSessions.add(context.sessionID);
+          await observeSession(context.sessionID);
           const cleared = await clearClosedLoops(context.sessionID);
           return toolResult(context.sessionID, { cleared });
         }
@@ -879,7 +1179,7 @@ var server = async ({ client }, options) => {
       const agent = typeof input?.agent === "string" && input.agent.trim() ? input.agent : isRecord(output.message) && typeof output.message.agent === "string" ? output.message.agent : undefined;
       if (typeof sessionID !== "string")
         return;
-      observedSessions.add(sessionID);
+      await observeSession(sessionID);
       if (typeof agent !== "string" || !agent.trim())
         return;
       lastPromptAgentBySession.set(sessionID, agent.trim());
@@ -887,6 +1187,7 @@ var server = async ({ client }, options) => {
     async "experimental.chat.system.transform"(input, output) {
       if (typeof input.sessionID !== "string")
         return;
+      await observeSession(input.sessionID);
       const loops = await openLoops(input.sessionID);
       const reminder = systemReminder(loops);
       if (!reminder)
@@ -901,6 +1202,7 @@ var server = async ({ client }, options) => {
 ${reminder}`;
     },
     async "experimental.session.compacting"(input, output) {
+      await observeSession(input.sessionID);
       const loops = await openLoops(input.sessionID);
       const context = compactionContext(loops);
       if (context)
@@ -911,7 +1213,7 @@ ${reminder}`;
       const sessionID = sessionIDFromEvent(typed);
       if (!sessionID)
         return;
-      observedSessions.add(sessionID);
+      await observeSession(sessionID);
       if (isBusyEvent(typed)) {
         busySessions.add(sessionID);
         for (const pending of dynamicPending.values()) {
@@ -963,13 +1265,20 @@ async function setupV2(context) {
   const maxLoopsPerSession = positiveNumberOr(options.max_loops_per_session, DEFAULT_MAX_LOOPS_PER_SESSION);
   const busyBackoffMs = positiveNumberOr(options.busy_backoff_seconds, DEFAULT_BUSY_BACKOFF_SECONDS) * 1000;
   const failureBackoffMs = positiveNumberOr(options.failure_backoff_seconds, DEFAULT_FAILURE_BACKOFF_SECONDS) * 1000;
+  const maxFailureBackoffMs = positiveNumberOr(options.max_failure_backoff_seconds, DEFAULT_MAX_FAILURE_BACKOFF_SECONDS) * 1000;
+  const maxConsecutiveFailures = positiveNumberOr(options.max_consecutive_failures, DEFAULT_MAX_CONSECUTIVE_FAILURES);
   const maxLoopAgeMs = nonNegativeNumberOr(options.max_loop_age_days, DEFAULT_MAX_LOOP_AGE_DAYS) * 24 * 60 * 60 * 1000;
   const dynamicMaxDelaySeconds = positiveNumberOr(options.dynamic_max_delay_seconds, DEFAULT_DYNAMIC_MAX_DELAY_SECONDS);
   const restrictedAgents = restrictedAgentSet(options);
   const timers = new Map;
   const sendingLoops = new Set;
   const busySessions = new Set;
+  const instanceID = randomUUID();
+  const loopOwnerID = `server-v2:${process.pid}:${randomUUID()}`;
+  const ownedSessions = new Map;
+  const ownershipQueues = new Map;
   const observedSessions = new Set;
+  const staleDynamicCandidates = new Map;
   const lastPromptAgentBySession = new Map;
   const dynamicPending = new Map;
   const registrations = [];
@@ -996,11 +1305,48 @@ async function setupV2(context) {
       clearTimeout(timer);
     timers.delete(loopID);
   }
-  function scheduleTimer(loop) {
+  async function loseOwnership(sessionID) {
+    ownedSessions.delete(sessionID);
+    for (const loop of await activeLoops(sessionID))
+      cancelTimer(loop.id);
+    for (const [loopID, pending] of dynamicPending) {
+      if (pending.sessionID === sessionID)
+        dynamicPending.delete(loopID);
+    }
+  }
+  async function acquireOwnership(sessionID) {
+    return enqueueSessionOperation(ownershipQueues, sessionID, async () => {
+      observedSessions.add(sessionID);
+      const lease = await acquireSessionLease(sessionID, instanceID, SESSION_LEASE_MS);
+      if (!lease) {
+        await loseOwnership(sessionID);
+        return false;
+      }
+      ownedSessions.set(sessionID, lease);
+      for (const loop of await activeLoops(sessionID))
+        scheduleTimer(loop);
+      return true;
+    });
+  }
+  async function renewOwnership(sessionID) {
+    return enqueueSessionOperation(ownershipQueues, sessionID, async () => {
+      const lease = ownedSessions.get(sessionID);
+      if (!lease)
+        return false;
+      const renewed = await renewSessionLease(sessionID, instanceID, lease.revision, SESSION_LEASE_MS);
+      if (!renewed) {
+        await loseOwnership(sessionID);
+        return false;
+      }
+      ownedSessions.set(sessionID, renewed);
+      return true;
+    });
+  }
+  function scheduleTimer(loop, minimumDelayMs = 0) {
     cancelTimer(loop.id);
-    if (loop.status !== "active" || loop.nextRunAt == null)
+    if (loop.status !== "active" || loop.nextRunAt == null || !ownedSessions.has(loop.sessionID))
       return;
-    const delay = Math.max(0, loop.nextRunAt - Date.now());
+    const delay = Math.max(minimumDelayMs, loop.nextRunAt - Date.now());
     const timer = setTimeout(() => {
       timers.delete(loop.id);
       runDue(loop.id);
@@ -1016,11 +1362,8 @@ async function setupV2(context) {
     sendingLoops.add(loopID);
     try {
       await runDueLocked(loopID);
-    } catch (error) {
-      v2Log("error", "Loop iteration failed unexpectedly", {
-        loopID,
-        error: error instanceof Error ? error.message : String(error)
-      });
+    } catch {
+      v2Log("error", "Loop scheduler operation failed", { loopID, category: "scheduler" });
     } finally {
       sendingLoops.delete(loopID);
     }
@@ -1029,34 +1372,61 @@ async function setupV2(context) {
     let loop = await getLoop(loopID);
     if (!loop || loop.status !== "active" || loop.nextRunAt == null)
       return;
+    if (!await renewOwnership(loop.sessionID))
+      return;
+    const lease = ownedSessions.get(loop.sessionID);
+    if (!lease || !await ownsSessionLease(loop.sessionID, instanceID, lease.revision)) {
+      await loseOwnership(loop.sessionID);
+      return;
+    }
     if (loop.nextRunAt > Date.now()) {
       scheduleTimer(loop);
       return;
     }
-    const claimed = await claimDueRun(loopID, RUN_CLAIM_LEASE_MS);
+    if (!observedSessions.has(loop.sessionID)) {
+      scheduleTimer(loop, Math.min(loop.intervalMs ?? busyBackoffMs, busyBackoffMs));
+      v2Log("info", "Skipping loop because session ownership is unknown", { loopID, category: "ownership" });
+      return;
+    }
+    const owner = await acquireLoopOwner(loopID, loopOwnerID, RUN_CLAIM_LEASE_MS);
+    const claimed = owner ? await claimDueRunOwned(loopID, owner, RUN_CLAIM_LEASE_MS) : null;
     if (!claimed) {
       loop = await getLoop(loopID);
       if (loop)
         scheduleTimer(loop);
       return;
     }
-    loop = claimed;
+    loop = claimed.loop;
     if (maxLoopAgeMs > 0 && Date.now() - loop.createdAt >= maxLoopAgeMs) {
-      await stopLoop(loopID, `expired after ${Math.round(maxLoopAgeMs / 86400000)} days`);
+      await stopLoopClaimed(loopID, claimed, `expired after ${Math.round(maxLoopAgeMs / 86400000)} days`);
       return;
     }
     if (await isSessionBusy(loop.sessionID)) {
-      const deferred = await recordRunDeferred(loopID, "skipped_busy", Math.min(loop.intervalMs ?? busyBackoffMs, busyBackoffMs));
-      scheduleTimer(deferred);
+      const deferred = await recordRunDeferredClaimed(loopID, claimed, "skipped_busy", Math.min(loop.intervalMs ?? busyBackoffMs, busyBackoffMs));
+      if (deferred)
+        scheduleTimer(deferred);
       return;
     }
     if (isRestrictedAgent(lastPromptAgentBySession.get(loop.sessionID))) {
-      const deferred = await recordRunDeferred(loopID, "skipped_plan", Math.min(loop.intervalMs ?? busyBackoffMs, busyBackoffMs));
-      scheduleTimer(deferred);
+      const deferred = await recordRunDeferredClaimed(loopID, claimed, "skipped_plan", Math.min(loop.intervalMs ?? busyBackoffMs, busyBackoffMs));
+      if (deferred)
+        scheduleTimer(deferred);
+      return;
+    }
+    const injectionLease = ownedSessions.get(loop.sessionID);
+    if (!injectionLease || !await ownsSessionLease(loop.sessionID, instanceID, injectionLease.revision)) {
+      await loseOwnership(loop.sessionID);
       return;
     }
     if (loop.mode === "dynamic") {
       dynamicPending.set(loopID, { sessionID: loop.sessionID, sawBusy: false });
+    }
+    if (!await confirmRunClaim(loopID, claimed)) {
+      dynamicPending.delete(loopID);
+      const current = await getLoop(loopID);
+      if (current)
+        scheduleTimer(current);
+      return;
     }
     try {
       await context.session.prompt({
@@ -1066,27 +1436,31 @@ async function setupV2(context) {
       });
     } catch (error) {
       dynamicPending.delete(loopID);
-      if (!observedSessions.has(loop.sessionID)) {
-        v2Log("info", "Skipping loop for a session this process has not observed", { loopID, sessionID: loop.sessionID });
-        return;
+      const failed = await recordRunFailedClaimed(loopID, claimed, error instanceof Error ? error.message : String(error), failureBackoffMs, maxConsecutiveFailures, maxFailureBackoffMs);
+      if (failed)
+        scheduleTimer(failed);
+      else {
+        const current = await getLoop(loopID);
+        if (current)
+          scheduleTimer(current);
       }
-      const failed = await recordRunFailed(loopID, error instanceof Error ? error.message : String(error), failureBackoffMs);
-      scheduleTimer(failed);
-      v2Log("error", "Loop iteration prompt failed", { loopID, error: failed.lastError ?? undefined });
+      v2Log("error", "Loop iteration prompt failed", { loopID, error: failed?.lastError ?? undefined });
       return;
     }
     busySessions.add(loop.sessionID);
     observedSessions.add(loop.sessionID);
-    const sent = await recordRunSent(loopID);
+    const sent = await recordRunSentClaimed(loopID, claimed);
+    if (!sent)
+      return;
     if (sent.mode !== "dynamic" || sent.status !== "active")
       dynamicPending.delete(loopID);
     scheduleTimer(sent);
   }
   async function runDueForSession(sessionID) {
     const loops = await activeLoops(sessionID);
-    const now2 = Date.now();
+    const now = Date.now();
     for (const loop of loops) {
-      if (loop.nextRunAt == null || loop.nextRunAt > now2)
+      if (loop.nextRunAt == null || loop.nextRunAt > now)
         continue;
       await runDue(loop.id);
       if (busySessions.has(sessionID))
@@ -1113,15 +1487,30 @@ async function setupV2(context) {
     const loops = await activeLoops();
     for (const loop of loops) {
       if (loop.nextRunAt == null) {
-        if (loop.mode === "dynamic")
-          await stopLoop(loop.id, "not rescheduled before OpenCode restarted");
+        if (loop.mode === "dynamic") {
+          staleDynamicCandidates.set(loop.id, { sessionID: loop.sessionID, updatedAt: loop.updatedAt });
+          v2Log("info", "Dynamic loop is an orphaned/stale restart candidate pending session ownership", {
+            loopID: loop.id,
+            sessionID: loop.sessionID
+          });
+        }
         continue;
       }
-      scheduleTimer(loop);
+    }
+  }
+  async function observeSession(sessionID) {
+    observedSessions.add(sessionID);
+    if (!await acquireOwnership(sessionID))
+      return;
+    for (const [loopID, candidate] of staleDynamicCandidates) {
+      if (candidate.sessionID !== sessionID)
+        continue;
+      staleDynamicCandidates.delete(loopID);
+      await stopLoopIfUnchanged(loopID, candidate.updatedAt, "not rescheduled before OpenCode restarted");
     }
   }
   async function requireSessionLoop(loopID, sessionID) {
-    observedSessions.add(sessionID);
+    await observeSession(sessionID);
     const loop = await getLoop(loopID);
     if (!loop)
       throw new Error(`no loop found with id "${loopID}"`);
@@ -1134,7 +1523,7 @@ async function setupV2(context) {
     const sessionID = typeof data.sessionID === "string" ? data.sessionID : undefined;
     if (!sessionID)
       return;
-    observedSessions.add(sessionID);
+    await observeSession(sessionID);
     switch (event.type) {
       case "session.status": {
         const status = data.status;
@@ -1187,10 +1576,12 @@ async function setupV2(context) {
     maxLoopsPerSession,
     dynamicMaxDelaySeconds,
     observedSessions,
+    observeSession,
     dynamicPending,
     scheduleTimer,
     cancelTimer,
-    requireSessionLoop
+    requireSessionLoop,
+    acquireOwnership
   };
   if (registerCommand) {
     registrations.push(await context.command.transform((draft) => {
@@ -1217,6 +1608,7 @@ async function setupV2(context) {
       draft.add(tool);
   }));
   registrations.push(await context.session.hook("context", async (sessionContext) => {
+    await observeSession(sessionContext.sessionID);
     const loops = await openLoops(sessionContext.sessionID);
     const reminder = systemReminder(loops);
     if (!reminder)
@@ -1225,7 +1617,12 @@ async function setupV2(context) {
       return;
     sessionContext.system.push({ type: "text", text: reminder });
   }));
-  await rehydrate().catch((error) => v2Log("error", "Failed to rehydrate loops", { error: error instanceof Error ? error.message : String(error) }));
+  await rehydrate().catch(() => v2Log("error", "Failed to rehydrate loops", { category: "state" }));
+  const leaseHeartbeat = setInterval(() => {
+    for (const sessionID of ownedSessions.keys())
+      renewOwnership(sessionID);
+  }, SESSION_LEASE_HEARTBEAT_MS);
+  leaseHeartbeat.unref?.();
   const abortController = new AbortController;
   let eventIterator;
   const consumer = (async () => {
@@ -1239,20 +1636,21 @@ async function setupV2(context) {
           break;
         await handleV2Event(value);
       }
-    } catch (error) {
+    } catch {
       if (!abortController.signal.aborted)
-        v2Log("error", "V2 event consumer stopped", {
-          error: error instanceof Error ? error.message : String(error)
-        });
+        v2Log("error", "V2 event consumer stopped", { category: "event" });
     }
   })();
   return async () => {
+    clearInterval(leaseHeartbeat);
     abortController.abort();
     for (const timer of timers.values())
       clearTimeout(timer);
     timers.clear();
     dynamicPending.clear();
     sendingLoops.clear();
+    await Promise.all([...ownedSessions.values()].map((lease) => releaseSessionLease(lease.sessionID, instanceID, lease.revision)));
+    ownedSessions.clear();
     for (const registration of registrations)
       await registration.dispose();
     const termination = Promise.allSettled([consumer, eventIterator?.return?.()]);
@@ -1284,7 +1682,7 @@ function loopToolsV2(services) {
       options: { codemode: false },
       execute: async (args, toolContext) => {
         const input = args;
-        services.observedSessions.add(toolContext.sessionID);
+        await services.observeSession(toolContext.sessionID);
         const dynamic = !input.interval?.trim();
         const loop = await createLoop(toolContext.sessionID, {
           prompt: input.instruction,
@@ -1308,7 +1706,6 @@ function loopToolsV2(services) {
       input: v2ObjectSchema({}),
       options: { codemode: false },
       execute: async (_args, toolContext) => {
-        services.observedSessions.add(toolContext.sessionID);
         return { content: await toolResult(toolContext.sessionID) };
       }
     },
@@ -1419,7 +1816,7 @@ function loopToolsV2(services) {
       input: v2ObjectSchema({}),
       options: { codemode: false },
       execute: async (_args, toolContext) => {
-        services.observedSessions.add(toolContext.sessionID);
+        await services.observeSession(toolContext.sessionID);
         const cleared = await clearClosedLoops(toolContext.sessionID);
         return { content: await toolResult(toolContext.sessionID, { cleared }) };
       }

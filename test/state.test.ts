@@ -3,7 +3,11 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import {
+  acquireLoopOwner,
+  acquireSessionLease,
+  claimDueRunOwned,
   clearClosedLoops,
+  confirmRunClaim,
   createLoop,
   formatInterval,
   formatLoops,
@@ -12,12 +16,17 @@ import {
   activeLoops,
   parseInterval,
   pauseLoop,
+  ownsSessionLease,
   recordRunDeferred,
+  recordRunSentClaimed,
   recordRunFailed,
   recordRunSent,
+  releaseSessionLease,
+  renewSessionLease,
   resumeLoop,
   scheduleNextRun,
   stopLoop,
+  stopLoopIfUnchanged,
   stopLoopsForSession,
 } from "../src/state"
 
@@ -56,6 +65,44 @@ test("formats intervals back to compact strings", () => {
   expect(formatInterval(3_600_000)).toBe("1h")
   expect(formatInterval(null)).toBe("dynamic")
 })
+
+test("atomically acquires, revises, validates, and releases session leases", async () => {
+  const first = await acquireSessionLease("ses_1", "instance-a", 60_000)
+  expect(first?.revision).toBe(1)
+  expect(await acquireSessionLease("ses_1", "instance-b", 60_000)).toBeNull()
+  expect(await ownsSessionLease("ses_1", "instance-a", first!.revision)).toBe(true)
+
+  const renewed = await renewSessionLease("ses_1", "instance-a", first!.revision, 60_000)
+  expect(renewed?.revision).toBe(2)
+  expect(await ownsSessionLease("ses_1", "instance-a", first!.revision)).toBe(false)
+  expect(await releaseSessionLease("ses_1", "instance-a", first!.revision)).toBe(false)
+  expect(await releaseSessionLease("ses_1", "instance-a", renewed!.revision)).toBe(true)
+  expect((await acquireSessionLease("ses_1", "instance-b", 60_000))?.instanceID).toBe("instance-b")
+})
+
+test("only one process can acquire a session lease", async () => {
+  const worker = join(dir, "acquire.ts")
+  await writeFile(
+    worker,
+    `import { acquireSessionLease } from ${JSON.stringify(join(process.cwd(), "src/state.ts"))}\n` +
+      `const lease = await acquireSessionLease("ses_shared", process.argv[2]!, 60_000)\n` +
+      `await Bun.write(Bun.stdout, lease ? "acquired\\n" : "denied\\n")\n` +
+      `process.exit(0)\n`,
+  )
+  const results = await Promise.all(
+    Array.from({ length: 8 }, async (_, index) => {
+      const child = Bun.spawn([globalThis.process.execPath, worker, `instance-${index}`], {
+        env: { ...Bun.env, OPENCODE_LOOP_STATE_PATH: join(dir, "shared.json") },
+        stdout: "pipe",
+      })
+      const output = await new Response(child.stdout).text()
+      expect(await child.exited).toBe(0)
+      return output.trim()
+    }),
+  )
+  expect(results.filter((result) => result === "acquired")).toHaveLength(1)
+  expect(results.filter((result) => result === "denied")).toHaveLength(7)
+}, 15_000)
 
 test("creates, lists, pauses, resumes, and stops a loop", async () => {
   const created = await createLoop("ses_1", { prompt: "check the deploy", intervalMs: 600_000 })
@@ -110,6 +157,40 @@ test("dynamic loops schedule one run at a time", async () => {
   expect(sent.runCount).toBe(1)
 })
 
+test("conditional dynamic cleanup ignores missing and changed loops", async () => {
+  const removed = await createLoop("ses_1", { prompt: "removed", mode: "dynamic" })
+  await stopLoop(removed.id)
+  await clearClosedLoops("ses_1")
+  expect(await stopLoopIfUnchanged(removed.id, removed.updatedAt, "stale after restart")).toBeNull()
+
+  const scheduled = await createLoop("ses_1", { prompt: "scheduled", mode: "dynamic" })
+  await scheduleNextRun(scheduled.id, 60_000, "still owned")
+  expect(await stopLoopIfUnchanged(scheduled.id, scheduled.updatedAt, "stale after restart")).toBeNull()
+  expect((await getLoop(scheduled.id))?.status).toBe("active")
+})
+
+test("serializes state mutations across processes", async () => {
+  const script = `
+    import { createLoop } from "./src/state.ts"
+    await Promise.all(Array.from({ length: 12 }, (_, index) =>
+      createLoop("session_" + process.pid + "_" + index, { prompt: "tick", intervalMs: 60000 })
+    ))
+  `
+  const options = {
+    cwd: join(import.meta.dir, ".."),
+    env: { ...process.env },
+    stdout: "pipe" as const,
+    stderr: "pipe" as const,
+  }
+  const children = [
+    Bun.spawn([process.execPath, "-e", script], options),
+    Bun.spawn([process.execPath, "-e", script], options),
+  ]
+  const exits = await Promise.all(children.map((child) => child.exited))
+  expect(exits).toEqual([0, 0])
+  expect(await listLoops()).toHaveLength(24)
+})
+
 test("recordRunSent does not resurrect stopped or paused loops", async () => {
   const created = await createLoop("ses_1", { prompt: "tick", intervalMs: 60_000 })
   await stopLoop(created.id, "done")
@@ -128,8 +209,58 @@ test("records deferred and failed runs with retry times", async () => {
 
   const failed = await recordRunFailed(created.id, "network exploded", 5000)
   expect(failed.lastResult).toBe("failed")
-  expect(failed.lastError).toBe("network exploded")
+  expect(failed.lastError).toBe("provider/model request failed")
+  expect(failed.consecutiveFailures).toBe(1)
+  expect(failed.nextRetryAt).toBe(failed.nextRunAt)
   expect(failed.status).toBe("active")
+
+  const second = await recordRunFailed(created.id, "secret provider response", 5000)
+  expect(second.nextRetryAt! - second.updatedAt).toBe(10_000)
+  const recovered = await recordRunSent(created.id)
+  expect(recovered.consecutiveFailures).toBe(0)
+  expect(recovered.nextRetryAt).toBeNull()
+  expect(recovered.lastError).toBeNull()
+})
+
+test("pauses loops after the bounded consecutive failure threshold", async () => {
+  const created = await createLoop("ses_1", { prompt: "tick", intervalMs: 600_000 })
+  await recordRunFailed(created.id, "sensitive one", 1000, 2, 1500)
+  const blocked = await recordRunFailed(created.id, "sensitive two", 1000, 2, 1500)
+  expect(blocked.status).toBe("paused")
+  expect(blocked.nextRunAt).toBeNull()
+  expect(blocked.nextRetryAt).toBeNull()
+  expect(blocked.blockedReason).toContain("2 consecutive")
+  expect(blocked.lastError).not.toContain("sensitive")
+})
+
+test("fences a claimed run when its owner lease is replaced", async () => {
+  const created = await createLoop("ses_1", { prompt: "tick", intervalMs: 60_000 })
+  await scheduleNextRun(created.id, 1)
+  await Bun.sleep(5)
+
+  const ownerA = await acquireLoopOwner(created.id, "owner-a", 1000)
+  expect(ownerA).not.toBeNull()
+  const claimA = await claimDueRunOwned(created.id, ownerA!, 30_000)
+  expect(claimA).not.toBeNull()
+  expect(await confirmRunClaim(created.id, claimA!)).not.toBeNull()
+
+  await Bun.sleep(1200)
+  const ownerB = await acquireLoopOwner(created.id, "owner-b", 30_000)
+  expect(ownerB?.ownerRevision).toBeGreaterThan(ownerA!.ownerRevision)
+  expect(await confirmRunClaim(created.id, claimA!)).toBeNull()
+  expect(await recordRunSentClaimed(created.id, claimA!)).toBeNull()
+  expect((await getLoop(created.id))?.runCount).toBe(0)
+})
+
+test("owner-aware claims reject a non-current lease", async () => {
+  const created = await createLoop("ses_1", { prompt: "tick", intervalMs: 60_000 })
+  await scheduleNextRun(created.id, 1)
+  await Bun.sleep(5)
+  const owner = await acquireLoopOwner(created.id, "owner-a", 30_000)
+  expect(owner).not.toBeNull()
+  expect(
+    await claimDueRunOwned(created.id, { ownerID: "owner-a", ownerRevision: owner!.ownerRevision + 1 }, 30_000),
+  ).toBeNull()
 })
 
 test("enforces the per-session open loop limit", async () => {
@@ -194,11 +325,15 @@ test("decodes persisted state with optional fields omitted", async () => {
   expect(loop?.lastResult).toBeNull()
   expect(loop?.maxRuns).toBeNull()
   expect(loop?.agent).toBeNull()
+  expect(loop?.consecutiveFailures).toBe(0)
+  expect(loop?.nextRetryAt).toBeNull()
+  expect(loop?.blockedReason).toBeNull()
 })
 
 test("writes state with owner-only file permissions", async () => {
   await createLoop("ses_1", { prompt: "tick", intervalMs: 60_000 })
   const mode = (await stat(process.env.OPENCODE_LOOP_STATE_PATH!)).mode & 0o777
+  if (process.platform === "win32") return
   expect(mode).toBe(0o600)
 })
 
